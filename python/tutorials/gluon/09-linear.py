@@ -223,9 +223,144 @@ def matmul_ori_kernel(
         GROUP_SIZE_M: constexpr,
     ):
     blocked_a_layout: constexpr = BlockedLayout(
-        size_per_thread=(1,8),
+        size_per_thread=(1,4),
         threads_per_warp=(8,8),
+        warps_per_cta=(4,2),
+        order=(1,0)
+    )
+    blocked_b_layout: constexpr = BlockedLayout(
+        size_per_thread=(2,8),
+        threads_per_warp=(4,16),
         warps_per_cta=(8,1),
+        order=(1,0)
+    )
+    linear_layout: constexpr = DistributedLinearLayout(
+        reg_bases=((1,0), (0,1), (0,2), (0,4)), # 16
+        lane_bases=((0,8), (0,16), (0,32), (0,64), (2,0), (4,0)), # 64
+        warp_bases=((8,0), (16,0), (32,0)), # 8
+        block_bases=[],
+        shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+    )
+    mfma_layout: constexpr = AMDMFMALayout(version=3, instr_shape=(16, 16),
+                                transposed=True, warps_per_cta=(2, 4))
+    dot_a_layout: constexpr = DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=4)
+    dot_b_layout: constexpr = DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=4)
+
+
+    shared_a_layout: constexpr = SwizzledSharedLayout(vec=4, per_phase=1, max_phase=16, order=(1,0))
+    shared_b_layout: constexpr = AMDRotatingSharedLayout(vec=4, per_phase=1, max_phase=16, order=(0,1))
+
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # gl.assume(pid_m >= 0)
+    # gl.assume(pid_n >= 0)
+    # gl.assume(stride_am > 0)
+    # gl.assume(stride_ak > 0)
+    # gl.assume(stride_bn > 0)
+    # gl.assume(stride_bk > 0)
+    # gl.assume(stride_cm > 0)
+    # gl.assume(stride_cn > 0)
+
+    offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=SliceLayout(1, blocked_a_layout))) % M
+    offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=SliceLayout(0, blocked_a_layout))
+    offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
+    ga0 = cdna3.buffer_load(a_ptr, offs_a, mask=offs_ak[None, :] < K)
+
+    offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=SliceLayout(1, blocked_b_layout))
+    offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=SliceLayout(0, blocked_b_layout))) % N
+    offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    gb0 = cdna3.buffer_load(b_ptr, offs_b, mask=offs_bk[:, None] < K)
+
+    smem_a = allocate_shared_memory(a_ptr.dtype.element_ty, [1, BLOCK_SIZE_M, BLOCK_SIZE_K], shared_a_layout)
+    smem_b = allocate_shared_memory(b_ptr.dtype.element_ty, [1, BLOCK_SIZE_K, BLOCK_SIZE_N], shared_b_layout)
+
+    smem_a0 = smem_a.index(0)
+    smem_a0.store(ga0)
+
+    smem_b0 = smem_b.index(0)
+    gbT0 = in_thread_transpose(gb0, linear_layout)
+    smem_b0.store(gbT0)
+
+    accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout)
+
+    totol_loops = gl.cdiv(K, BLOCK_SIZE_K)
+    index = 0
+    a_stride_k = BLOCK_SIZE_K * stride_ak
+    b_stride_k = BLOCK_SIZE_K * stride_bk
+    for k in range(0, totol_loops-1):
+        k += 1
+        a_ptr += a_stride_k
+        b_ptr += b_stride_k
+
+        a_mask = offs_ak[None, :] < K - k * BLOCK_SIZE_K
+        b_mask = offs_bk[:, None] < K - k * BLOCK_SIZE_K
+
+        ga = cdna3.buffer_load(a_ptr, offs_a, mask=a_mask)
+
+        ra = smem_a0.load(dot_a_layout)
+        gb = cdna3.buffer_load(b_ptr, offs_b, mask=b_mask)
+        rb = smem_b0.load(dot_b_layout)
+        
+        accumulator = cdna3.mfma(ra, rb, accumulator) # no gl.dot
+
+        new_index = index + 1
+        cond = new_index < 1
+        index = gl.where(cond, new_index, 0)
+
+        smem_a0 = smem_a.index(index)
+        smem_a0.store(ga)
+
+        smem_b0 = smem_b.index(index)
+        gbT = in_thread_transpose(gb, linear_layout)
+        smem_b0.store(gbT)
+
+    ra = smem_a0.load(dot_a_layout)
+    rb = smem_b0.load(dot_b_layout)
+
+
+    cond1 = totol_loops >= 1
+
+    accumulator1 = cdna3.mfma(ra, rb, accumulator) if cond1 else accumulator
+
+    accumulator = gl.where(cond1, accumulator1, accumulator)
+
+    gc = accumulator.to(c_ptr.dtype.element_ty)
+    
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=SliceLayout(1, mfma_layout))
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=SliceLayout(0, mfma_layout))
+    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    cdna3.buffer_store(gc, c_ptr, offs_c, mask=c_mask)
+
+@triton.autotune(
+    configs=[triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_stages=2, num_warps=8)
+    ],
+    key=['M', 'N', 'K'],
+)
+@jit
+def matmul_ori_nk_kernel(
+        a_ptr, b_ptr, c_ptr, 
+        M, N, K,
+        stride_am, stride_ak,  #
+        stride_bk, stride_bn,  #
+        stride_cm, stride_cn,
+        BLOCK_SIZE_M: constexpr,
+        BLOCK_SIZE_N: constexpr,
+        BLOCK_SIZE_K: constexpr,
+        GROUP_SIZE_M: constexpr,
+    ):
+    blocked_a_layout: constexpr = BlockedLayout(
+        size_per_thread=(1,4),
+        threads_per_warp=(8,8),
+        warps_per_cta=(4,2),
         order=(1,0)
     )
     blocked_b_layout: constexpr = BlockedLayout(
@@ -375,6 +510,23 @@ def matmul1(a, b):
     )
     return c
 
+def matmul_nk(a, b):
+    M, K = a.shape
+    _, N = b.shape
+
+
+    c = torch.empty((M,N), dtype=a.dtype, device=a.device)
+
+    grid1 = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+
+    matmul_ori_nk_kernel[grid1](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        # 128, 128, 32, 4
+    )
+    return c
 # ori_kernel = triton.compile("gluon/matmul_ori_kernel.ttgir")
 # tri_kernel = triton.compile("gluon/matmul_kernel.ttgir")
 
@@ -397,7 +549,8 @@ def matmul2(a, b, kernel):
 from matrix_multiplication import matmul as triton_matmul
 # triton_matmul = lambda a, b: matmul2(a, b, tri_kernel)
 # gluon_matmul = lambda a, b: matmul2(a, b, ori_kernel)
-gluon_matmul = matmul1
+# gluon_matmul = matmul1  # 使用matmul1而不是matmul_nk
+gluon_matmul = matmul_nk
 
 configs = [
     triton.testing.Benchmark(
